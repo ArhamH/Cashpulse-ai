@@ -1,75 +1,57 @@
 import os
-import uuid
 import json
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
-from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Depends, HTTPException
+import httpx
+from fastapi import FastAPI, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
-from sqlalchemy import String, Float, Boolean, DateTime, JSON, select, func, desc
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from pydantic import BaseModel, EmailStr, Field
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger("CashPulse")
+logging.basicConfig(level=logging.INFO)
 
-DB_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./fintech.db")
-engine = create_async_engine(DB_URL, echo=False)
-AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-class Base(DeclarativeBase):
-    pass
+app = FastAPI(title="CashPulse FinTech Agent (Supabase REST)")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def _uuid(): return str(uuid.uuid4())
-def _utcnow(): return datetime.now(timezone.utc)
+def _get_supabase_headers(auth_token: Optional[str] = None) -> dict[str, str]:
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Content-Type": "application/json",
+        "Prefer": "return=representation"
+    }
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+    else:
+        headers["Authorization"] = f"Bearer {SUPABASE_ANON_KEY}"
+    return headers
 
-class User(Base):
-    __tablename__ = "users"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    name: Mapped[str] = mapped_column(String(120))
-    email: Mapped[str] = mapped_column(String(255), unique=True)
-    baseline_income: Mapped[float] = mapped_column(Float, default=0.0)
+# ---------------------------------------------------------
+# Request / Response Schemas
+# ---------------------------------------------------------
+class SignupRequest(BaseModel):
+    name: str
+    email: EmailStr
+    password: str = Field(..., min_length=6)
+    baseline_income: float = 90000.0
 
-class Account(Base):
-    __tablename__ = "accounts"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(String(36), index=True)
-    account_type: Mapped[str] = mapped_column(String(20), default="checking")
-    balance: Mapped[float] = mapped_column(Float, default=0.0)
-    currency: Mapped[str] = mapped_column(String(8), default="INR")
-
-class Transaction(Base):
-    __tablename__ = "transactions"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    account_id: Mapped[str] = mapped_column(String(36), index=True)
-    amount: Mapped[float] = mapped_column(Float)
-    transaction_type: Mapped[str] = mapped_column(String(10))
-    category: Mapped[str] = mapped_column(String(64), default="uncategorized")
-    merchant_name: Mapped[Optional[str]] = mapped_column(String(160), nullable=True)
-    transaction_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-    is_recurring: Mapped[bool] = mapped_column(Boolean, default=False)
-    is_anomalous: Mapped[bool] = mapped_column(Boolean, default=False)
-
-class PendingAction(Base):
-    __tablename__ = "pending_actions"
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_uuid)
-    user_id: Mapped[str] = mapped_column(String(36), index=True)
-    title: Mapped[str] = mapped_column(String(200))
-    rationale: Mapped[str] = mapped_column(String(1024))
-    suggested_action_type: Mapped[str] = mapped_column(String(50))
-    action_payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
-    status: Mapped[str] = mapped_column(String(20), default="PENDING")
-    ai_available: Mapped[bool] = mapped_column(Boolean, default=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-
-async def get_db():
-    async with AsyncSessionLocal() as session:
-        yield session
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
 
 class TransactionCreate(BaseModel):
     account_id: str
@@ -87,144 +69,243 @@ class ScenarioRequest(BaseModel):
 class DecisionRequest(BaseModel):
     decision: str = Field(..., pattern="^(APPROVED|REJECTED)$")
 
-async def seed_if_empty():
-    async with AsyncSessionLocal() as db:
-        existing = await db.scalar(select(User).limit(1))
-        if not existing:
-            user = User(id="user-demo-001", name="Rahul Sharma", email="rahul@example.com", baseline_income=90000.0)
-            acc = Account(id="acc-demo-001", user_id="user-demo-001", balance=125000.0, currency="INR")
-            db.add_all([user, acc])
-
-            now = _utcnow()
-            txns = [
-                (90000.0, "credit", "salary", "TechCorp Salary", 25, True, False),
-                (28000.0, "debit", "housing", "Apartment Rent", 24, True, False),
-                (1499.0, "debit", "utilities", "JioAirFiber", 20, True, False),
-                (649.0, "debit", "entertainment", "Netflix", 18, True, False),
-                (1200.0, "debit", "food", "Swiggy", 12, False, False),
-                (4200.0, "debit", "groceries", "Blinkit", 8, False, False),
-                (21000.0, "debit", "shopping", "Croma Store", 3, False, True),
-            ]
-            for amt, t_type, cat, merch, days, rec, anom in txns:
-                db.add(Transaction(
-                    account_id="acc-demo-001",
-                    amount=amt,
-                    transaction_type=t_type,
-                    category=cat,
-                    merchant_name=merch,
-                    transaction_date=now - timedelta(days=days),
-                    is_recurring=rec,
-                    is_anomalous=anom
-                ))
-
-            db.add(PendingAction(
-                id="act-001",
-                user_id="user-demo-001",
-                title="Cap Food Delivery Outflow at INR 6,000/mo",
-                rationale="Food delivery expenses (Swiggy + Zomato) are trending 35% above the baseline threshold.",
-                suggested_action_type="BUDGET_CAP",
-                status="PENDING",
-                ai_available=False
-            ))
-            await db.commit()
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    await seed_if_empty()
-    yield
-
-app = FastAPI(title="CashPulse FinTech Agent", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
+# ---------------------------------------------------------
+# Static Frontend Serving & Healthcheck
+# ---------------------------------------------------------
 @app.get("/", include_in_schema=False)
 async def serve_ui():
     if os.path.exists("index.html"):
         return FileResponse("index.html")
-    return {"message": "CashPulse Core Backend Active"}
+    return {"message": "CashPulse Core API Active (Supabase REST mode)"}
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "service": "CashPulse"}
+    return {
+        "status": "healthy",
+        "service": "CashPulse AI",
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_ANON_KEY)
+    }
 
+# ---------------------------------------------------------
+# Supabase Authentication Routes
+# ---------------------------------------------------------
+@app.post("/api/v1/auth/signup")
+async def auth_signup(payload: SignupRequest):
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise HTTPException(500, "Supabase environment variables not configured on server")
+
+    signup_endpoint = f"{SUPABASE_URL}/auth/v1/signup"
+    auth_body = {
+        "email": payload.email,
+        "password": payload.password,
+        "data": {"name": payload.name}
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.post(signup_endpoint, json=auth_body, headers=_get_supabase_headers())
+        if res.status_code >= 400:
+            error_detail = res.json().get("msg") or res.json().get("error_description") or res.text
+            raise HTTPException(res.status_code, f"Supabase Auth Error: {error_detail}")
+        auth_data = res.json()
+
+    user_id = auth_data.get("id") or (auth_data.get("user", {}).get("id") if "user" in auth_data else None)
+    access_token = auth_data.get("access_token")
+
+    # Seed initial user profile and baseline account in Supabase tables
+    if user_id:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = _get_supabase_headers(access_token)
+            
+            # Insert User Profile
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/users",
+                json={
+                    "id": user_id,
+                    "name": payload.name,
+                    "email": payload.email,
+                    "baseline_income": payload.baseline_income
+                },
+                headers=headers
+            )
+            
+            # Insert Initial Account
+            acc_id = f"acc-{user_id[:8]}"
+            await client.post(
+                f"{SUPABASE_URL}/rest/v1/accounts",
+                json={
+                    "id": acc_id,
+                    "user_id": user_id,
+                    "account_type": "checking",
+                    "balance": 125000.0,
+                    "currency": "INR"
+                },
+                headers=headers
+            )
+
+    return {
+        "message": "User registered successfully",
+        "user_id": user_id,
+        "access_token": access_token
+    }
+
+@app.post("/api/v1/auth/login")
+async def auth_login(payload: LoginRequest):
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise HTTPException(500, "Supabase environment variables not configured on server")
+
+    login_endpoint = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
+    body = {"email": payload.email, "password": payload.password}
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.post(login_endpoint, json=body, headers=_get_supabase_headers())
+        if res.status_code >= 400:
+            error_detail = res.json().get("msg") or res.json().get("error_description") or "Invalid credentials"
+            raise HTTPException(res.status_code, error_detail)
+        token_data = res.json()
+
+    user_info = token_data.get("user", {})
+    return {
+        "access_token": token_data.get("access_token"),
+        "user_id": user_info.get("id"),
+        "email": user_info.get("email"),
+        "name": user_info.get("user_metadata", {}).get("name", "User")
+    }
+
+# ---------------------------------------------------------
+# Financial Telemetry & Runway Engine
+# ---------------------------------------------------------
 @app.get("/api/v1/analytics/runway/{user_id}")
-async def get_runway(user_id: str, db: AsyncSession = Depends(get_db)):
-    user = await db.get(User, user_id)
-    if not user:
-        raise HTTPException(404, "User not found")
+async def get_runway(user_id: str, authorization: Optional[str] = Header(None)):
+    token = authorization.replace("Bearer ", "") if authorization else None
+    headers = _get_supabase_headers(token)
 
-    balance = (await db.scalar(select(func.sum(Account.balance)).where(Account.user_id == user_id))) or 0.0
-    cutoff = _utcnow() - timedelta(days=30)
-    txns = (await db.scalars(
-        select(Transaction).join(Account, Transaction.account_id == Account.id)
-        .where(Account.user_id == user_id, Transaction.transaction_date >= cutoff)
-        .order_by(desc(Transaction.transaction_date))
-    )).all()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # 1. Fetch User Accounts
+        acc_res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/accounts?user_id=eq.{user_id}&select=id,balance",
+            headers=headers
+        )
+        accounts = acc_res.json() if acc_res.status_code == 200 else []
+        total_balance = sum(float(a.get("balance", 0.0)) for a in accounts)
+        account_ids = [a["id"] for a in accounts]
 
-    inflow = sum(t.amount for t in txns if t.transaction_type == "credit")
-    burn = sum(t.amount for t in txns if t.transaction_type == "debit")
-    recurring = sum(t.amount for t in txns if t.is_recurring and t.transaction_type == "debit")
+        txns = []
+        if account_ids:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+            acc_filter = f"in.({','.join(account_ids)})"
+            txn_url = (
+                f"{SUPABASE_URL}/rest/v1/transactions?"
+                f"account_id={acc_filter}&transaction_date=gte.{cutoff}"
+                f"&order=transaction_date.desc&limit=100"
+            )
+            txn_res = await client.get(txn_url, headers=headers)
+            if txn_res.status_code == 200:
+                txns = txn_res.json()
+
+    inflow = sum(float(t["amount"]) for t in txns if t.get("transaction_type") == "credit")
+    burn = sum(float(t["amount"]) for t in txns if t.get("transaction_type") == "debit")
+    recurring = sum(float(t["amount"]) for t in txns if t.get("is_recurring") and t.get("transaction_type") == "debit")
+    
     daily_burn = burn / 30.0 if burn > 0 else 0.0
-    runway_days = round(balance / daily_burn, 1) if daily_burn > 0 else 999.0
+    runway_days = round(total_balance / daily_burn, 1) if daily_burn > 0 else 999.0
 
     return {
         "user_id": user_id,
-        "current_balance": round(balance, 2),
+        "current_balance": round(total_balance, 2),
         "inflow_30d": round(inflow, 2),
         "burn_30d": round(burn, 2),
         "runway_days": runway_days,
         "recurring_total": round(recurring, 2),
-        "anomalies_detected": sum(1 for t in txns if t.is_anomalous),
+        "anomalies_detected": sum(1 for t in txns if t.get("is_anomalous")),
         "transactions": [
-            {"id": t.id, "amount": t.amount, "type": t.transaction_type, "merchant": t.merchant_name, "category": t.category, "is_anomalous": t.is_anomalous}
+            {
+                "id": t.get("id"),
+                "amount": float(t.get("amount", 0)),
+                "type": t.get("transaction_type"),
+                "merchant": t.get("merchant_name"),
+                "category": t.get("category"),
+                "is_anomalous": t.get("is_anomalous", False)
+            }
             for t in txns
         ]
     }
 
+# ---------------------------------------------------------
+# Transactions Ingestion (Deterministic Ledger)
+# ---------------------------------------------------------
 @app.post("/api/v1/transactions")
-async def create_transaction(req: TransactionCreate, db: AsyncSession = Depends(get_db)):
-    account = await db.get(Account, req.account_id)
-    if not account:
-        raise HTTPException(404, "Account not found")
+async def record_transaction(req: TransactionCreate, authorization: Optional[str] = Header(None)):
+    token = authorization.replace("Bearer ", "") if authorization else None
+    headers = _get_supabase_headers(token)
 
     ttype = req.transaction_type.lower()
-    is_anom = (ttype == "debit" and req.amount > 15000)
+    is_anom = (ttype == "debit" and req.amount > 15000.0)
 
-    txn = Transaction(
-        account_id=req.account_id,
-        amount=req.amount,
-        transaction_type=ttype,
-        category=req.category.lower(),
-        merchant_name=req.merchant_name,
-        is_recurring=req.is_recurring,
-        is_anomalous=is_anom
-    )
-    account.balance += req.amount if ttype == "credit" else -req.amount
-    db.add(txn)
-    await db.commit()
-    return {"message": "Transaction recorded", "new_balance": round(account.balance, 2), "anomalous": is_anom}
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Fetch current balance
+        acc_res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/accounts?id=eq.{req.account_id}&select=balance",
+            headers=headers
+        )
+        acc_data = acc_res.json()
+        if not acc_data:
+            raise HTTPException(404, "Target account not found")
 
+        curr_balance = float(acc_data[0].get("balance", 0.0))
+        new_balance = curr_balance + req.amount if ttype == "credit" else curr_balance - req.amount
+
+        # Mutate account balance
+        await client.patch(
+            f"{SUPABASE_URL}/rest/v1/accounts?id=eq.{req.account_id}",
+            json={"balance": new_balance},
+            headers=headers
+        )
+
+        # Insert transaction
+        txn_payload = {
+            "account_id": req.account_id,
+            "amount": req.amount,
+            "transaction_type": ttype,
+            "category": req.category.lower(),
+            "merchant_name": req.merchant_name,
+            "is_recurring": req.is_recurring,
+            "is_anomalous": is_anom,
+            "transaction_date": datetime.now(timezone.utc).isoformat()
+        }
+        await client.post(f"{SUPABASE_URL}/rest/v1/transactions", json=txn_payload, headers=headers)
+
+    return {"message": "Transaction recorded", "new_balance": round(new_balance, 2), "anomalous": is_anom}
+
+# ---------------------------------------------------------
+# What-If Shock Simulation (Gemini + PostgREST Staging)
+# ---------------------------------------------------------
 @app.post("/api/v1/simulations/run")
-async def run_simulation(req: ScenarioRequest, db: AsyncSession = Depends(get_db)):
-    user = await db.get(User, req.user_id)
-    if not user:
-        raise HTTPException(404, "User not found")
+async def run_simulation(req: ScenarioRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.replace("Bearer ", "") if authorization else None
+    headers = _get_supabase_headers(token)
 
-    balance = (await db.scalar(select(func.sum(Account.balance)).where(Account.user_id == req.user_id))) or 0.0
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        acc_res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/accounts?user_id=eq.{req.user_id}&select=balance",
+            headers=headers
+        )
+        accounts = acc_res.json() if acc_res.status_code == 200 else []
+        balance = sum(float(a.get("balance", 0.0)) for a in accounts)
 
-    explanation = f"Deterministic model: Based on balance of INR {balance:,.0f}, scenario '{req.scenario_description}' introduces liquidity risk."
+    explanation = f"Deterministic model: Based on liquid balance of INR {balance:,.0f}, '{req.scenario_description}' introduces liquidity risk."
     gap = 8500.0
     risk = "HIGH" if balance < 50000 else "MEDIUM"
     ai_used = False
 
-    if api_key:
+    if GEMINI_API_KEY:
         try:
             from google import genai
-            client = genai.Client(api_key=api_key)
-            prompt = f"Balance: INR {balance}. Scenario: {req.scenario_description}. Return JSON: explanation, monthly_gap, risk (LOW/MEDIUM/HIGH/CRITICAL)."
-            resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+            client_ai = genai.Client(api_key=GEMINI_API_KEY)
+            prompt = (
+                f"Balance: INR {balance}. Scenario shock: {req.scenario_description}. "
+                f"Return JSON strictly with keys: explanation, monthly_gap, risk (LOW/MEDIUM/HIGH/CRITICAL)."
+            )
+            resp = client_ai.models.generate_content(model="gemini-2.0-flash", contents=prompt)
             data = json.loads(resp.text.replace("```json", "").replace("```", "").strip())
             explanation = data.get("explanation", explanation)
             gap = float(data.get("monthly_gap", gap))
@@ -233,17 +314,24 @@ async def run_simulation(req: ScenarioRequest, db: AsyncSession = Depends(get_db
         except Exception:
             pass
 
-    action = PendingAction(
-        user_id=req.user_id,
-        title=f"Mitigate: {req.scenario_description[:35]}",
-        rationale=explanation,
-        suggested_action_type="BUDGET_CAP",
-        status="PENDING",
-        ai_available=ai_used
-    )
-    db.add(action)
-    await db.commit()
-    await db.refresh(action)
+    # Stage Action into Pending Actions table
+    staged_payload = {
+        "user_id": req.user_id,
+        "title": f"Mitigate: {req.scenario_description[:35]}",
+        "rationale": explanation,
+        "suggested_action_type": "BUDGET_CAP",
+        "status": "PENDING",
+        "ai_available": ai_used
+    }
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        ins_res = await client.post(
+            f"{SUPABASE_URL}/rest/v1/pending_actions",
+            json=staged_payload,
+            headers=headers
+        )
+        staged_items = ins_res.json() if ins_res.status_code in [200, 201] else []
+
+    action_id = staged_items[0].get("id") if staged_items else "staged-001"
 
     return {
         "scenario": req.scenario_description,
@@ -251,20 +339,35 @@ async def run_simulation(req: ScenarioRequest, db: AsyncSession = Depends(get_db
         "risk_level": risk,
         "explanation": explanation,
         "ai_available": ai_used,
-        "action_id": action.id
+        "action_id": action_id
     }
 
+# ---------------------------------------------------------
+# Human-in-the-Loop (HITL) Queue & Decision Gate
+# ---------------------------------------------------------
 @app.get("/api/v1/actions/pending/{user_id}")
-async def list_pending_actions(user_id: str, db: AsyncSession = Depends(get_db)):
-    return (await db.scalars(
-        select(PendingAction).where(PendingAction.user_id == user_id, PendingAction.status == "PENDING")
-    )).all()
+async def list_pending_actions(user_id: str, authorization: Optional[str] = Header(None)):
+    token = authorization.replace("Bearer ", "") if authorization else None
+    headers = _get_supabase_headers(token)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/pending_actions?user_id=eq.{user_id}&status=eq.PENDING&order=created_at.desc",
+            headers=headers
+        )
+        return res.json() if res.status_code == 200 else []
 
 @app.post("/api/v1/actions/{action_id}/decide")
-async def decide_action(action_id: str, body: DecisionRequest, db: AsyncSession = Depends(get_db)):
-    action = await db.get(PendingAction, action_id)
-    if not action:
-        raise HTTPException(404, "Action not found")
-    action.status = body.decision.upper()
-    await db.commit()
-    return {"action_id": action.id, "status": action.status}
+async def decide_action(action_id: str, body: DecisionRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.replace("Bearer ", "") if authorization else None
+    headers = _get_supabase_headers(token)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        res = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/pending_actions?id=eq.{action_id}",
+            json={"status": body.decision.upper()},
+            headers=headers
+        )
+        if res.status_code >= 400:
+            raise HTTPException(res.status_code, "Unable to record decision")
+    return {"action_id": action_id, "status": body.decision.upper()}
