@@ -15,8 +15,8 @@ load_dotenv()
 logger = logging.getLogger("CashPulse")
 logging.basicConfig(level=logging.INFO)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL") or "https://ztoqlduggsczxyyhmrry.supabase.co"
+SUPABASE_ANON_KEY = (os.getenv("SUPABASE_ANON_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp0b3FsZHVnZ3Njenh5eWhtcnJ5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA0ODc0MzcsImV4cCI6MjEwNjA2MzQzN30.6j0G79xUAf5n6tw-ipUEcXsMUG2jbBpHUAo7Pfb1wjw").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 app = FastAPI(title="CashPulse FinTech Agent (Supabase REST)")
