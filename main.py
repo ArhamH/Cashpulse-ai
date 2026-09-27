@@ -2,21 +2,29 @@ import os
 import json
 import logging
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any
+from typing import Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 load_dotenv()
 logger = logging.getLogger("CashPulse")
 logging.basicConfig(level=logging.INFO)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL") or "https://ztoqlduggsczxyyhmrry.supabase.co"
-SUPABASE_ANON_KEY = (os.getenv("SUPABASE_ANON_KEY") or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp0b3FsZHVnZ3Njenh5eWhtcnJ5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA0ODc0MzcsImV4cCI6MjEwNjA2MzQzN30.6j0G79xUAf5n6tw-ipUEcXsMUG2jbBpHUAo7Pfb1wjw").strip()
+# Supabase REST Configuration with reliable fallbacks
+SUPABASE_URL = (
+    os.getenv("SUPABASE_URL") or "https://ztoqlduggsczxyyhmrry.supabase.co"
+).rstrip("/")
+
+SUPABASE_ANON_KEY = (
+    os.getenv("SUPABASE_ANON_KEY")
+    or "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inp0b3FsZHVnZ3Njenh5eWhtcnJ5Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTA0ODc0MzcsImV4cCI6MjEwNjA2MzQzN30.6j0G79xUAf5n6tw-ipUEcXsMUG2jbBpHUAo7Pfb1wjw"
+).strip()
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 app = FastAPI(title="CashPulse FinTech Agent (Supabase REST)")
@@ -45,12 +53,12 @@ def _get_supabase_headers(auth_token: Optional[str] = None) -> dict[str, str]:
 # ---------------------------------------------------------
 class SignupRequest(BaseModel):
     name: str
-    email: EmailStr
+    email: str
     password: str = Field(..., min_length=6)
     baseline_income: float = 90000.0
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
 
 class TransactionCreate(BaseModel):
@@ -61,6 +69,11 @@ class TransactionCreate(BaseModel):
     merchant_name: Optional[str] = None
     is_recurring: bool = False
 
+class BalanceUpdateRequest(BaseModel):
+    account_id: str
+    new_balance: float = Field(..., ge=0)
+    reason: Optional[str] = "Manual Balance Override"
+
 class ScenarioRequest(BaseModel):
     user_id: str
     scenario_description: str
@@ -70,7 +83,7 @@ class DecisionRequest(BaseModel):
     decision: str = Field(..., pattern="^(APPROVED|REJECTED)$")
 
 # ---------------------------------------------------------
-# Static Frontend Serving & Healthcheck
+# Root & Static Serving
 # ---------------------------------------------------------
 @app.get("/", include_in_schema=False)
 async def serve_ui():
@@ -87,12 +100,12 @@ async def health():
     }
 
 # ---------------------------------------------------------
-# Supabase Authentication Routes
+# Authentication Routes
 # ---------------------------------------------------------
 @app.post("/api/v1/auth/signup")
 async def auth_signup(payload: SignupRequest):
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise HTTPException(500, "Supabase environment variables not configured on server")
+        raise HTTPException(500, "Supabase credentials not configured on server")
 
     signup_endpoint = f"{SUPABASE_URL}/auth/v1/signup"
     auth_body = {
@@ -111,12 +124,11 @@ async def auth_signup(payload: SignupRequest):
     user_id = auth_data.get("id") or (auth_data.get("user", {}).get("id") if "user" in auth_data else None)
     access_token = auth_data.get("access_token")
 
-    # Seed initial user profile and baseline account in Supabase tables
     if user_id:
         async with httpx.AsyncClient(timeout=10.0) as client:
             headers = _get_supabase_headers(access_token)
             
-            # Insert User Profile
+            # Register user record
             await client.post(
                 f"{SUPABASE_URL}/rest/v1/users",
                 json={
@@ -128,7 +140,7 @@ async def auth_signup(payload: SignupRequest):
                 headers=headers
             )
             
-            # Insert Initial Account
+            # Create default checking account
             acc_id = f"acc-{user_id[:8]}"
             await client.post(
                 f"{SUPABASE_URL}/rest/v1/accounts",
@@ -151,7 +163,7 @@ async def auth_signup(payload: SignupRequest):
 @app.post("/api/v1/auth/login")
 async def auth_login(payload: LoginRequest):
     if not SUPABASE_URL or not SUPABASE_ANON_KEY:
-        raise HTTPException(500, "Supabase environment variables not configured on server")
+        raise HTTPException(500, "Supabase credentials not configured on server")
 
     login_endpoint = f"{SUPABASE_URL}/auth/v1/token?grant_type=password"
     body = {"email": payload.email, "password": payload.password}
@@ -172,7 +184,7 @@ async def auth_login(payload: LoginRequest):
     }
 
 # ---------------------------------------------------------
-# Financial Telemetry & Runway Engine
+# Analytics & Runway Engine
 # ---------------------------------------------------------
 @app.get("/api/v1/analytics/runway/{user_id}")
 async def get_runway(user_id: str, authorization: Optional[str] = Header(None)):
@@ -180,7 +192,6 @@ async def get_runway(user_id: str, authorization: Optional[str] = Header(None)):
     headers = _get_supabase_headers(token)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # 1. Fetch User Accounts
         acc_res = await client.get(
             f"{SUPABASE_URL}/rest/v1/accounts?user_id=eq.{user_id}&select=id,balance",
             headers=headers
@@ -231,7 +242,7 @@ async def get_runway(user_id: str, authorization: Optional[str] = Header(None)):
     }
 
 # ---------------------------------------------------------
-# Transactions Ingestion (Deterministic Ledger)
+# Transactions & Liquid Balance Modification
 # ---------------------------------------------------------
 @app.post("/api/v1/transactions")
 async def record_transaction(req: TransactionCreate, authorization: Optional[str] = Header(None)):
@@ -242,7 +253,6 @@ async def record_transaction(req: TransactionCreate, authorization: Optional[str
     is_anom = (ttype == "debit" and req.amount > 15000.0)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        # Fetch current balance
         acc_res = await client.get(
             f"{SUPABASE_URL}/rest/v1/accounts?id=eq.{req.account_id}&select=balance",
             headers=headers
@@ -261,7 +271,7 @@ async def record_transaction(req: TransactionCreate, authorization: Optional[str
             headers=headers
         )
 
-        # Insert transaction
+        # Ingest record into ledger
         txn_payload = {
             "account_id": req.account_id,
             "amount": req.amount,
@@ -276,8 +286,56 @@ async def record_transaction(req: TransactionCreate, authorization: Optional[str
 
     return {"message": "Transaction recorded", "new_balance": round(new_balance, 2), "anomalous": is_anom}
 
+@app.patch("/api/v1/accounts/balance")
+async def update_liquid_balance(req: BalanceUpdateRequest, authorization: Optional[str] = Header(None)):
+    token = authorization.replace("Bearer ", "") if authorization else None
+    headers = _get_supabase_headers(token)
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        # Check current balance
+        acc_res = await client.get(
+            f"{SUPABASE_URL}/rest/v1/accounts?id=eq.{req.account_id}&select=balance",
+            headers=headers
+        )
+        acc_data = acc_res.json()
+        if not acc_data:
+            raise HTTPException(404, "Target account not found")
+
+        old_balance = float(acc_data[0].get("balance", 0.0))
+        delta = req.new_balance - old_balance
+
+        # 1. Update account balance directly in database
+        patch_res = await client.patch(
+            f"{SUPABASE_URL}/rest/v1/accounts?id=eq.{req.account_id}",
+            json={"balance": req.new_balance},
+            headers=headers
+        )
+        if patch_res.status_code >= 400:
+            raise HTTPException(patch_res.status_code, "Failed to update account balance")
+
+        # 2. Add an audit adjustment entry so ledger reconciliation remains mathematically sound
+        if delta != 0:
+            txn_payload = {
+                "account_id": req.account_id,
+                "amount": abs(delta),
+                "transaction_type": "credit" if delta > 0 else "debit",
+                "category": "adjustment",
+                "merchant_name": f"{req.reason} ({'+' if delta > 0 else '-'}₹{abs(delta):,.2f})",
+                "is_recurring": False,
+                "is_anomalous": False,
+                "transaction_date": datetime.now(timezone.utc).isoformat()
+            }
+            await client.post(f"{SUPABASE_URL}/rest/v1/transactions", json=txn_payload, headers=headers)
+
+    return {
+        "message": "Liquid balance updated successfully",
+        "old_balance": round(old_balance, 2),
+        "new_balance": round(req.new_balance, 2),
+        "delta": round(delta, 2)
+    }
+
 # ---------------------------------------------------------
-# What-If Shock Simulation (Gemini + PostgREST Staging)
+# What-If Shock Simulation
 # ---------------------------------------------------------
 @app.post("/api/v1/simulations/run")
 async def run_simulation(req: ScenarioRequest, authorization: Optional[str] = Header(None)):
@@ -314,7 +372,7 @@ async def run_simulation(req: ScenarioRequest, authorization: Optional[str] = He
         except Exception:
             pass
 
-    # Stage Action into Pending Actions table
+    # Stage proposal into pending actions
     staged_payload = {
         "user_id": req.user_id,
         "title": f"Mitigate: {req.scenario_description[:35]}",
@@ -343,7 +401,7 @@ async def run_simulation(req: ScenarioRequest, authorization: Optional[str] = He
     }
 
 # ---------------------------------------------------------
-# Human-in-the-Loop (HITL) Queue & Decision Gate
+# HITL Action Approvals
 # ---------------------------------------------------------
 @app.get("/api/v1/actions/pending/{user_id}")
 async def list_pending_actions(user_id: str, authorization: Optional[str] = Header(None)):
