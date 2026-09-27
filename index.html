@@ -15,11 +15,31 @@
 </head>
 <body class="bg-[#09090b] text-zinc-100 font-sans selection:bg-emerald-500/20 selection:text-emerald-300">
   <div id="root"></div>
+
   <script type="text/babel">
     const { useState, useEffect } = React;
     const API_BASE = "";
 
     function App() {
+      // Auth State
+      const [session, setSession] = useState(() => {
+        try {
+          const saved = localStorage.getItem("cashpulse_auth");
+          return saved ? JSON.parse(saved) : null;
+        } catch (e) {
+          return null;
+        }
+      });
+      const [authMode, setAuthMode] = useState("login"); // 'login' | 'signup'
+      const [authEmail, setAuthEmail] = useState("");
+      const [authPassword, setAuthPassword] = useState("");
+      const [authName, setAuthName] = useState("");
+      const [showPassword, setShowPassword] = useState(false);
+      const [rememberMe, setRememberMe] = useState(true);
+      const [authLoading, setAuthLoading] = useState(false);
+      const [authError, setAuthError] = useState("");
+
+      // Dashboard State
       const [activeTab, setActiveTab] = useState("runway");
       const [balance, setBalance] = useState(125000);
       const [inflow, setInflow] = useState(90000);
@@ -38,7 +58,6 @@
       const [txnCategory, setTxnCategory] = useState("Dining");
       const [txnType, setTxnType] = useState("debit");
 
-      // USP-2: Dynamic Cash Collapse Date calculation
       const getCollapseDate = (days) => {
         const d = new Date();
         d.setDate(d.getDate() + Math.round(days));
@@ -49,9 +68,68 @@
         });
       };
 
-      const refreshData = async () => {
+      const handleAuthSubmit = async (e) => {
+        e.preventDefault();
+        setAuthLoading(true);
+        setAuthError("");
+
+        const endpoint = authMode === "login" ? `${API_BASE}/api/v1/auth/login` : `${API_BASE}/api/v1/auth/signup`;
+        const payload = authMode === "login" 
+          ? { email: authEmail, password: authPassword }
+          : { name: authName || "User", email: authEmail, password: authPassword };
+
         try {
-          const res = await fetch(`${API_BASE}/api/v1/analytics/runway/user-demo-001`);
+          const res = await fetch(endpoint, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            throw new Error(data.detail || "Authentication failed");
+          }
+
+          const sessionData = {
+            access_token: data.access_token,
+            user_id: data.user_id || "user-demo-001",
+            name: data.name || authName || "Verified Member",
+            email: data.email || authEmail
+          };
+
+          if (rememberMe) {
+            localStorage.setItem("cashpulse_auth", JSON.stringify(sessionData));
+          }
+          setSession(sessionData);
+        } catch (err) {
+          setAuthError(err.message);
+        } finally {
+          setAuthLoading(false);
+        }
+      };
+
+      const handleDemoBypass = () => {
+        const demoUser = {
+          access_token: "demo-judge-token",
+          user_id: "user-demo-001",
+          name: "Rahul Sharma",
+          email: "judge.demo@cashpulse.ai"
+        };
+        localStorage.setItem("cashpulse_auth", JSON.stringify(demoUser));
+        setSession(demoUser);
+      };
+
+      const handleLogout = () => {
+        localStorage.removeItem("cashpulse_auth");
+        setSession(null);
+      };
+
+      const refreshData = async () => {
+        if (!session) return;
+        const uid = session.user_id || "user-demo-001";
+        const authHeaders = session.access_token ? { "Authorization": `Bearer ${session.access_token}` } : {};
+
+        try {
+          const res = await fetch(`${API_BASE}/api/v1/analytics/runway/${uid}`, { headers: authHeaders });
           if (res.ok) {
             const data = await res.json();
             setBalance(data.current_balance);
@@ -65,7 +143,7 @@
         } catch (e) {}
 
         try {
-          const actRes = await fetch(`${API_BASE}/api/v1/actions/pending/user-demo-001`);
+          const actRes = await fetch(`${API_BASE}/api/v1/actions/pending/${uid}`, { headers: authHeaders });
           if (actRes.ok) {
             const actData = await actRes.json();
             setActions(actData);
@@ -73,17 +151,26 @@
         } catch (e) {}
       };
 
-      useEffect(() => { refreshData(); }, []);
+      useEffect(() => {
+        if (session) refreshData();
+      }, [session]);
 
       const handleRunSimulation = async () => {
-        if (!scenarioPrompt) return;
+        if (!scenarioPrompt || !session) return;
         setIsSimulating(true);
         setSimulationResult(null);
         try {
           const res = await fetch(`${API_BASE}/api/v1/simulations/run`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ user_id: "user-demo-001", scenario_description: scenarioPrompt, horizon_days: 90 }),
+            headers: { 
+              "Content-Type": "application/json",
+              ...(session.access_token ? { "Authorization": `Bearer ${session.access_token}` } : {})
+            },
+            body: JSON.stringify({ 
+              user_id: session.user_id || "user-demo-001", 
+              scenario_description: scenarioPrompt, 
+              horizon_days: 90 
+            }),
           });
           if (res.ok) {
             const data = await res.json();
@@ -99,7 +186,10 @@
         try {
           await fetch(`${API_BASE}/api/v1/actions/${actionId}/decide`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { 
+              "Content-Type": "application/json",
+              ...(session?.access_token ? { "Authorization": `Bearer ${session.access_token}` } : {})
+            },
             body: JSON.stringify({ decision })
           });
         } catch (e) {}
@@ -109,13 +199,16 @@
       const handleAddTxn = async (e) => {
         e.preventDefault();
         const amt = parseFloat(txnAmount);
-        if (!amt) return;
+        if (!amt || !session) return;
         try {
           await fetch(`${API_BASE}/api/v1/transactions`, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { 
+              "Content-Type": "application/json",
+              ...(session.access_token ? { "Authorization": `Bearer ${session.access_token}` } : {})
+            },
             body: JSON.stringify({
-              account_id: "acc-demo-001",
+              account_id: `acc-${(session.user_id || "user-demo-001").slice(0, 8)}`,
               amount: amt,
               transaction_type: txnType,
               category: txnCategory,
@@ -129,43 +222,195 @@
         refreshData();
       };
 
+      // -------------------------------------------------------------
+      // AUTH VIEW (Matching UI Layout in Reference)
+      // -------------------------------------------------------------
+      if (!session) {
+        return (
+          <div className="min-h-screen w-full flex items-center justify-center p-4 sm:p-6 bg-gradient-to-br from-indigo-950 via-[#0a0a0f] to-zinc-950">
+            <div className="max-w-4xl w-full bg-white text-zinc-800 rounded-3xl shadow-2xl overflow-hidden flex flex-col md:flex-row border border-zinc-100">
+              
+              {/* Left Column: Image Banner */}
+              <div className="md:w-5/12 relative hidden md:block bg-zinc-900">
+                <img 
+                  src="https://images.unsplash.com/photo-1507525428034-b723cf961d3e?auto=format&fit=crop&w=1000&q=80" 
+                  alt="Coastal horizon" 
+                  className="w-full h-full object-cover"
+                />
+                <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent flex flex-col justify-end p-8 text-white">
+                  <span className="text-[11px] font-mono tracking-widest text-emerald-400 uppercase font-semibold">Zero Hallucination</span>
+                  <h3 className="text-xl font-bold mt-1 tracking-tight">Autonomous Liquidity & Runway Intelligence</h3>
+                  <p className="text-xs text-zinc-300 mt-2 font-normal leading-relaxed">
+                    Deterministic SQL balance telemetry coupled with Gemini 2.0 stress simulation.
+                  </p>
+                </div>
+              </div>
+
+              {/* Right Column: Clean Auth Form */}
+              <div className="md:w-7/12 p-8 sm:p-12 flex flex-col justify-center">
+                <div className="flex items-center gap-2 mb-6">
+                  <div className="w-8 h-8 rounded-full bg-gradient-to-tr from-amber-400 via-rose-400 to-indigo-500 flex items-center justify-center text-white text-xs font-black shadow-md">
+                    CP
+                  </div>
+                  <span className="font-bold text-zinc-900 tracking-tight text-base">CashPulse AI</span>
+                </div>
+
+                <h2 className="text-2xl font-bold text-zinc-900 tracking-tight">
+                  {authMode === "login" ? "Nice to see you again" : "Create your account"}
+                </h2>
+                <p className="text-xs text-zinc-500 mt-1">
+                  {authMode === "login" ? "Enter your credentials to access your financial telemetry" : "Set up your deterministic treasury profile"}
+                </p>
+
+                {authError && (
+                  <div className="mt-4 p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-600 text-xs font-medium">
+                    {authError}
+                  </div>
+                )}
+
+                <form onSubmit={handleAuthSubmit} className="mt-6 space-y-4">
+                  {authMode === "signup" && (
+                    <div>
+                      <label className="text-xs font-semibold text-zinc-600 block mb-1">Full Name</label>
+                      <input 
+                        type="text"
+                        required
+                        value={authName}
+                        onChange={(e) => setAuthName(e.target.value)}
+                        placeholder="e.g. Rahul Sharma"
+                        className="w-full bg-zinc-50 hover:bg-zinc-100/80 focus:bg-white border border-zinc-200 focus:border-blue-600 rounded-xl px-3.5 py-2.5 text-xs text-zinc-900 outline-none transition-all"
+                      />
+                    </div>
+                  )}
+
+                  <div>
+                    <label className="text-xs font-semibold text-zinc-600 block mb-1">Email or identifier</label>
+                    <input 
+                      type="email"
+                      required
+                      value={authEmail}
+                      onChange={(e) => setAuthEmail(e.target.value)}
+                      placeholder="name@company.com"
+                      className="w-full bg-zinc-50 hover:bg-zinc-100/80 focus:bg-white border border-zinc-200 focus:border-blue-600 rounded-xl px-3.5 py-2.5 text-xs text-zinc-900 outline-none transition-all"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="text-xs font-semibold text-zinc-600 block mb-1">Password</label>
+                    <div className="relative">
+                      <input 
+                        type={showPassword ? "text" : "password"}
+                        required
+                        value={authPassword}
+                        onChange={(e) => setAuthPassword(e.target.value)}
+                        placeholder="Enter password"
+                        className="w-full bg-zinc-50 hover:bg-zinc-100/80 focus:bg-white border border-zinc-200 focus:border-blue-600 rounded-xl px-3.5 py-2.5 text-xs text-zinc-900 outline-none transition-all pr-10"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword(!showPassword)}
+                        className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 text-xs"
+                      >
+                        {showPassword ? "Hide" : "Show"}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between pt-1">
+                    <label className="flex items-center gap-2 cursor-pointer select-none">
+                      <input 
+                        type="checkbox"
+                        checked={rememberMe}
+                        onChange={(e) => setRememberMe(e.target.checked)}
+                        className="rounded border-zinc-300 text-blue-600 focus:ring-0 w-3.5 h-3.5 cursor-pointer"
+                      />
+                      <span className="text-xs text-zinc-600 font-medium">Remember me</span>
+                    </label>
+                    <span className="text-xs font-semibold text-blue-600 hover:text-blue-700 cursor-pointer">
+                      Forgot password?
+                    </span>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={authLoading}
+                    className="w-full mt-2 py-3 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold tracking-wide transition-all shadow-md shadow-blue-600/25 active:scale-[0.99]"
+                  >
+                    {authLoading ? "Processing..." : (authMode === "login" ? "Sign in" : "Create Account")}
+                  </button>
+                </form>
+
+                {/* 1-Click Judge / Demo Bypass Button */}
+                <button
+                  type="button"
+                  onClick={handleDemoBypass}
+                  className="w-full mt-3 py-2.5 bg-zinc-900 hover:bg-zinc-800 text-zinc-100 rounded-xl text-xs font-semibold flex items-center justify-center gap-2 transition-all"
+                >
+                  <span className="text-amber-400">⚡</span> 1-Click Demo Login (Judge Bypass)
+                </button>
+
+                <p className="text-center text-xs text-zinc-500 mt-6 font-medium">
+                  {authMode === "login" ? "Don't have an account? " : "Already have an account? "}
+                  <button 
+                    type="button"
+                    onClick={() => { setAuthMode(authMode === "login" ? "signup" : "login"); setAuthError(""); }}
+                    className="font-bold text-blue-600 hover:underline"
+                  >
+                    {authMode === "login" ? "Sign up now" : "Sign in"}
+                  </button>
+                </p>
+              </div>
+
+            </div>
+          </div>
+        );
+      }
+
+      // -------------------------------------------------------------
+      // DASHBOARD VIEW
+      // -------------------------------------------------------------
       return (
         <div className="min-h-screen flex flex-col">
-          {/* Header Bar */}
+          {/* Header */}
           <header className="border-b border-zinc-800 bg-zinc-950/80 px-6 py-3.5 flex items-center justify-between sticky top-0 z-40 backdrop-blur-md">
             <div className="flex items-center gap-3">
               <div className="w-8 h-8 rounded-lg bg-emerald-500 flex items-center justify-center font-bold text-zinc-950">CP</div>
               <div>
                 <span className="text-lg font-bold text-white tracking-tight">CashPulse</span>
-                <span className="ml-2 px-2 py-0.5 text-[10px] font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 rounded-full">AI AGENT ACTIVE</span>
+                <span className="ml-2 px-2 py-0.5 text-[10px] font-mono bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 rounded-full">SUPABASE LIVE</span>
               </div>
             </div>
             <div className="flex items-center gap-3">
               <button onClick={() => setIsModalOpen(true)} className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 text-xs font-semibold rounded-lg transition-all shadow-md shadow-emerald-500/10">+ Log Txn</button>
               <div className="flex items-center gap-2 pl-3 border-l border-zinc-800">
-                <div className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-xs font-bold text-white">RS</div>
-                <div className="text-left hidden sm:block text-xs">
-                  <p className="font-semibold text-zinc-200">Rahul Sharma</p>
-                  <p className="text-[10px] text-zinc-500 font-mono">user-demo-001</p>
+                <div className="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center text-xs font-bold text-white uppercase">
+                  {session.name ? session.name.slice(0, 2) : "US"}
                 </div>
+                <div className="text-left hidden sm:block text-xs">
+                  <p className="font-semibold text-zinc-200">{session.name || "Authenticated User"}</p>
+                  <p className="text-[10px] text-zinc-500 font-mono">{session.email}</p>
+                </div>
+                <button onClick={handleLogout} className="ml-2 text-zinc-500 hover:text-rose-400 text-xs font-semibold px-2 py-1 rounded bg-zinc-900 border border-zinc-800">
+                  Logout
+                </button>
               </div>
             </div>
           </header>
 
-          {/* Stepper Workflow */}
+          {/* Stepper Architecture */}
           <div className="bg-zinc-900/50 border-b border-zinc-800/60 px-6 py-2">
             <div className="max-w-6xl mx-auto flex items-center justify-between text-[11px] font-mono text-zinc-400">
-              <span className="text-emerald-400 font-semibold">1. Data Ingest (SQL)</span>
+              <span className="text-emerald-400 font-semibold">1. Supabase PostgREST</span>
               <span>→</span>
-              <span className="text-emerald-400 font-semibold">2. Deterministic Burn Check</span>
+              <span className="text-emerald-400 font-semibold">2. Zero-Hallucination Aggregates</span>
               <span>→</span>
-              <span className="text-cyan-400 font-semibold">3. Gemini Risk Simulation</span>
+              <span className="text-cyan-400 font-semibold">3. Gemini 2.0 Risk Simulation</span>
               <span>→</span>
               <span className="text-purple-400 font-semibold">4. Human Approval Gate</span>
             </div>
           </div>
 
-          {/* Tabs Navigation */}
+          {/* Main Dashboard Navigation */}
           <main className="max-w-6xl w-full mx-auto px-4 py-6 flex-1 space-y-6">
             <div className="flex gap-1 p-1 bg-zinc-900 border border-zinc-800 rounded-xl w-fit">
               {["runway", "simulator", "hitl", "transactions"].map(tab => (
@@ -181,12 +426,11 @@
               ))}
             </div>
 
-            {/* TAB: Runway & Analytics */}
+            {/* TAB: Runway */}
             {activeTab === "runway" && (
               <div className="space-y-6">
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                  {/* Card 1: Balance with USP-1 badge */}
-                  <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between relative overflow-hidden">
+                  <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between">
                     <div className="flex justify-between items-start">
                       <p className="text-xs text-zinc-400">Liquid Balance</p>
                       <span className="text-[9px] font-mono text-emerald-400 bg-emerald-950/40 border border-emerald-500/30 px-1.5 py-0.5 rounded">
@@ -197,8 +441,7 @@
                     <p className="text-[11px] text-emerald-400 mt-2 font-mono">● Verified via SQL Aggregates</p>
                   </div>
 
-                  {/* Card 2: Runway with USP-2 Cash Collapse Countdown */}
-                  <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between relative">
+                  <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between">
                     <div className="flex justify-between items-start">
                       <p className="text-xs text-zinc-400">Estimated Runway</p>
                       <span className="text-[9px] font-mono text-cyan-400 bg-cyan-950/40 border border-cyan-500/30 px-1.5 py-0.5 rounded">
@@ -212,46 +455,37 @@
                     </div>
                   </div>
 
-                  {/* Card 3: Inflow / Outflow */}
                   <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between">
                     <p className="text-xs text-zinc-400">30D Inflow / Outflow</p>
                     <p className="text-lg font-mono font-bold mt-2 text-zinc-200">₹{inflow.toLocaleString()} / ₹{burn.toLocaleString()}</p>
-                    <p className="text-[11px] text-zinc-400 mt-2 font-mono">Net Burn: -₹{Math.abs(inflow - burn).toLocaleString()}</p>
+                    <p className="text-[11px] text-zinc-400 mt-2 font-mono">Net: ₹{(inflow - burn).toLocaleString()}</p>
                   </div>
 
-                  {/* Card 4: Recurring Commitments */}
                   <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between">
                     <p className="text-xs text-zinc-400">Recurring Commitments</p>
                     <p className="text-2xl font-mono font-bold mt-2 text-zinc-100">₹{recurring.toLocaleString("en-IN")}</p>
-                    <p className="text-[11px] text-amber-400 mt-2 font-mono">⚠️ {anomalies} Anomaly detected</p>
+                    <p className="text-[11px] text-amber-400 mt-2 font-mono">⚠️ {anomalies} Anomaly flagged</p>
                   </div>
                 </div>
 
-                {/* Features Pillars with Architecture Highlights */}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4 p-5 rounded-2xl bg-zinc-900/30 border border-zinc-800/60 text-xs">
                   <div>
-                    <h4 className="font-semibold text-emerald-400 mb-1 flex items-center gap-1.5">
-                      <span>🛡️</span> Deterministic SQL Engine
-                    </h4>
-                    <p className="text-zinc-400">Calculations run purely in database aggregates ensuring zero mathematical distortion or model hallucination.</p>
+                    <h4 className="font-semibold text-emerald-400 mb-1">🛡️ Deterministic SQL Engine</h4>
+                    <p className="text-zinc-400">Core balance calculations run through database aggregates with zero hallucination.</p>
                   </div>
                   <div>
-                    <h4 className="font-semibold text-cyan-400 mb-1 flex items-center gap-1.5">
-                      <span>🧠</span> Gemini 2.0 Risk Simulation
-                    </h4>
-                    <p className="text-zinc-400">LLM analyzes scenario shocks and translates financial strain into human explainable risk factors.</p>
+                    <h4 className="font-semibold text-cyan-400 mb-1">🧠 Explainable Gemini AI</h4>
+                    <p className="text-zinc-400">Simulates real-world expense shocks and explains deficit reasons step-by-step.</p>
                   </div>
                   <div>
-                    <h4 className="font-semibold text-purple-400 mb-1 flex items-center gap-1.5">
-                      <span>⚖️</span> Staged Action Governance
-                    </h4>
-                    <p className="text-zinc-400">Strict Human-in-the-Loop policy. Suggested budget caps remain staging-only until explicit manual consent.</p>
+                    <h4 className="font-semibold text-purple-400 mb-1">⚖️ Human-in-the-Loop Safe</h4>
+                    <p className="text-zinc-400">AI budget actions remain staged until authorized by the user.</p>
                   </div>
                 </div>
               </div>
             )}
 
-            {/* TAB: What-If Simulator */}
+            {/* TAB: Simulator */}
             {activeTab === "simulator" && (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
                 <div className="bg-zinc-900/80 border border-zinc-800 p-5 rounded-xl space-y-4 text-xs">
@@ -276,7 +510,7 @@
                     rows="3"
                     value={scenarioPrompt}
                     onChange={(e) => setScenarioPrompt(e.target.value)}
-                    placeholder="Enter scenario description (e.g. rent hike, sudden gadget purchase)..."
+                    placeholder="Enter scenario description (e.g. rent hike, unexpected expense)..."
                     className="w-full bg-zinc-950 border border-zinc-800 rounded-lg p-3 text-zinc-200 outline-none focus:border-cyan-500"
                   />
                   <button
@@ -294,30 +528,27 @@
                     <div className="w-14 h-14 rounded-full bg-indigo-600 flex items-center justify-center font-bold text-white shadow-inner">AI</div>
                   </div>
                   {!simulationResult && !isSimulating && (
-                    <p className="text-zinc-500 text-center">Enter a financial scenario on the left to review explainable deficit predictions.</p>
+                    <p className="text-zinc-500 text-center">Run a scenario on the left to review explainable deficit predictions.</p>
                   )}
                   {simulationResult && (
                     <div className="w-full space-y-3">
                       <div className="flex justify-between items-center border-b border-zinc-800 pb-2">
-                        <span className="font-semibold text-zinc-300">Simulation Shock Verdict</span>
+                        <span className="font-semibold text-zinc-300">Simulation Verdict</span>
                         <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-rose-500/20 text-rose-400 border border-rose-500/40">
                           {simulationResult.risk_level} RISK
                         </span>
                       </div>
-                      
-                      {/* Inverse Collapse Date Projection */}
                       <div className="p-2.5 rounded-lg bg-zinc-950 border border-zinc-800 flex justify-between items-center">
                         <span className="text-zinc-400 font-mono text-[11px]">Adjusted Collapse Date:</span>
                         <span className="text-rose-400 font-mono font-bold">
-                          {getCollapseDate(runwayDays * 0.65)} (Pushed Early)
+                          {getCollapseDate(runwayDays * 0.65)} (Accelerated)
                         </span>
                       </div>
-
                       <p className="bg-zinc-950 p-3 rounded-lg border border-zinc-800 text-zinc-300 leading-relaxed font-sans">
                         {simulationResult.explanation}
                       </p>
                       <div className="flex justify-between items-center text-[11px] text-emerald-400">
-                        <span>✔ Proposed mitigation staged in HITL queue.</span>
+                        <span>✔ Mitigation proposal staged in Action Queue.</span>
                         <button onClick={() => setActiveTab("hitl")} className="underline font-bold">View Queue →</button>
                       </div>
                     </div>
@@ -326,13 +557,13 @@
               </div>
             )}
 
-            {/* TAB: Action Queue (HITL) */}
+            {/* TAB: HITL Queue */}
             {activeTab === "hitl" && (
               <div className="space-y-4">
                 <div className="flex justify-between items-center text-xs">
                   <div>
                     <h3 className="text-sm font-semibold text-zinc-200">Human-In-The-Loop Approval Center</h3>
-                    <p className="text-[11px] text-zinc-400">Safety gate: AI recommendations cannot mutate state without explicit confirmation.</p>
+                    <p className="text-[11px] text-zinc-400">State mutations require authenticated confirmation before execution.</p>
                   </div>
                   <span className="text-amber-400 bg-amber-500/10 border border-amber-500/30 px-2 py-0.5 rounded text-[10px] font-mono">
                     Awaiting Sign-off
@@ -352,8 +583,8 @@
                       </div>
                       <p className="text-zinc-300 bg-zinc-950 p-2.5 rounded border border-zinc-800/80 leading-relaxed font-sans">{act.rationale}</p>
                       <div className="flex justify-end gap-2 pt-2">
-                        <button onClick={() => handleDecide(act.id, "REJECTED")} className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded font-medium transition-colors">Reject</button>
-                        <button onClick={() => handleDecide(act.id, "APPROVED")} className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold rounded transition-colors">Approve & Mutate State</button>
+                        <button onClick={() => handleDecide(act.id, "REJECTED")} className="px-3 py-1.5 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 rounded font-medium">Reject</button>
+                        <button onClick={() => handleDecide(act.id, "APPROVED")} className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold rounded">Approve & Mutate State</button>
                       </div>
                     </div>
                   ))
@@ -361,13 +592,13 @@
               </div>
             )}
 
-            {/* TAB: Ledger Transactions */}
+            {/* TAB: Ledger */}
             {activeTab === "transactions" && (
               <div className="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden text-xs">
                 <div className="p-4 border-b border-zinc-800 flex justify-between items-center">
                   <div>
                     <span className="font-semibold text-zinc-200 text-sm">Ledger Ingestion Telemetry</span>
-                    <p className="text-[11px] text-zinc-500 font-mono">Deterministic database state (Postgres / SQLite)</p>
+                    <p className="text-[11px] text-zinc-500 font-mono">Supabase PostgREST sync</p>
                   </div>
                   <span className="text-emerald-400 font-mono text-[10px] bg-emerald-950/40 border border-emerald-500/30 px-2 py-0.5 rounded">
                     Audit Grade
@@ -407,7 +638,7 @@
             )}
           </main>
 
-          {/* Modal */}
+          {/* Log Transaction Modal */}
           {isModalOpen && (
             <div className="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4 z-50">
               <div className="bg-zinc-900 border border-zinc-800 p-5 rounded-xl max-w-xs w-full space-y-3 text-xs shadow-2xl">
@@ -453,6 +684,7 @@
         </div>
       );
     }
+
     ReactDOM.createRoot(document.getElementById("root")).render(<App />);
   </script>
 </body>
