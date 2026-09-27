@@ -30,7 +30,7 @@
           return null;
         }
       });
-      const [authMode, setAuthMode] = useState("login"); // 'login' | 'signup'
+      const [authMode, setAuthMode] = useState("login");
       const [authEmail, setAuthEmail] = useState("");
       const [authPassword, setAuthPassword] = useState("");
       const [authName, setAuthName] = useState("");
@@ -52,6 +52,13 @@
       const [scenarioPrompt, setScenarioPrompt] = useState("");
       const [isSimulating, setIsSimulating] = useState(false);
       const [simulationResult, setSimulationResult] = useState(null);
+
+      // Direct Liquid Balance Edit State
+      const [isEditingBalance, setIsEditingBalance] = useState(false);
+      const [newBalanceInput, setNewBalanceInput] = useState("");
+      const [isUpdatingBalance, setIsUpdatingBalance] = useState(false);
+
+      // Transaction Modal State
       const [isModalOpen, setIsModalOpen] = useState(false);
       const [txnAmount, setTxnAmount] = useState("");
       const [txnMerchant, setTxnMerchant] = useState("");
@@ -155,6 +162,39 @@
         if (session) refreshData();
       }, [session]);
 
+      // Handle Direct Balance Modification
+      const handleSaveBalance = async (e) => {
+        e.preventDefault();
+        const val = parseFloat(newBalanceInput);
+        if (isNaN(val) || val < 0 || !session) return;
+
+        setIsUpdatingBalance(true);
+        try {
+          const accId = `acc-${(session.user_id || "user-demo-001").slice(0, 8)}`;
+          const res = await fetch(`${API_BASE}/api/v1/accounts/balance`, {
+            method: "PATCH",
+            headers: {
+              "Content-Type": "application/json",
+              ...(session.access_token ? { "Authorization": `Bearer ${session.access_token}` } : {})
+            },
+            body: JSON.stringify({
+              account_id: accId,
+              new_balance: val,
+              reason: "Manual Balance Override"
+            })
+          });
+          if (res.ok) {
+            setBalance(val);
+            setIsEditingBalance(false);
+            refreshData();
+          }
+        } catch (err) {
+          console.error("Failed to update liquid balance:", err);
+        } finally {
+          setIsUpdatingBalance(false);
+        }
+      };
+
       const handleRunSimulation = async () => {
         if (!scenarioPrompt || !session) return;
         setIsSimulating(true);
@@ -223,7 +263,7 @@
       };
 
       // -------------------------------------------------------------
-      // AUTH VIEW (Matching UI Layout in Reference)
+      // AUTH VIEW (Matching Split Layout)
       // -------------------------------------------------------------
       if (!session) {
         return (
@@ -286,7 +326,7 @@
                   <div>
                     <label className="text-xs font-semibold text-zinc-600 block mb-1">Email or identifier</label>
                     <input 
-                      type="email"
+                      type="text"
                       required
                       value={authEmail}
                       onChange={(e) => setAuthEmail(e.target.value)}
@@ -410,7 +450,7 @@
             </div>
           </div>
 
-          {/* Main Dashboard Navigation */}
+          {/* Main Navigation */}
           <main className="max-w-6xl w-full mx-auto px-4 py-6 flex-1 space-y-6">
             <div className="flex gap-1 p-1 bg-zinc-900 border border-zinc-800 rounded-xl w-fit">
               {["runway", "simulator", "hitl", "transactions"].map(tab => (
@@ -430,17 +470,62 @@
             {activeTab === "runway" && (
               <div className="space-y-6">
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                  <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between">
+                  {/* Card 1: Editable Liquid Balance */}
+                  <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between relative group">
                     <div className="flex justify-between items-start">
-                      <p className="text-xs text-zinc-400">Liquid Balance</p>
+                      <div className="flex items-center gap-1.5">
+                        <p className="text-xs text-zinc-400">Liquid Balance</p>
+                        <button 
+                          onClick={() => { setNewBalanceInput(balance); setIsEditingBalance(true); }}
+                          className="text-[11px] text-zinc-500 hover:text-emerald-400 transition-colors"
+                          title="Edit Balance"
+                        >
+                          ✏️
+                        </button>
+                      </div>
                       <span className="text-[9px] font-mono text-emerald-400 bg-emerald-950/40 border border-emerald-500/30 px-1.5 py-0.5 rounded">
                         🛡️ Zero-Hallucination
                       </span>
                     </div>
-                    <p className="text-2xl font-mono font-bold mt-2 text-zinc-100">₹{balance.toLocaleString("en-IN")}</p>
+
+                    {isEditingBalance ? (
+                      <form onSubmit={handleSaveBalance} className="mt-2 flex items-center gap-1.5">
+                        <span className="text-zinc-400 text-sm font-mono">₹</span>
+                        <input 
+                          type="number"
+                          step="any"
+                          value={newBalanceInput}
+                          onChange={(e) => setNewBalanceInput(e.target.value)}
+                          className="w-full bg-zinc-950 border border-emerald-500/60 rounded px-2 py-1 text-sm font-mono text-zinc-100 outline-none"
+                          autoFocus
+                        />
+                        <button 
+                          type="submit" 
+                          disabled={isUpdatingBalance} 
+                          className="px-2 py-1 bg-emerald-500 text-zinc-950 text-xs font-bold rounded"
+                        >
+                          {isUpdatingBalance ? "..." : "Save"}
+                        </button>
+                        <button 
+                          type="button" 
+                          onClick={() => setIsEditingBalance(false)} 
+                          className="px-2 py-1 bg-zinc-800 text-zinc-400 text-xs rounded hover:bg-zinc-700"
+                        >
+                          ✕
+                        </button>
+                      </form>
+                    ) : (
+                      <div className="flex items-baseline justify-between mt-2">
+                        <p className="text-2xl font-mono font-bold text-zinc-100">
+                          ₹{balance.toLocaleString("en-IN")}
+                        </p>
+                      </div>
+                    )}
+
                     <p className="text-[11px] text-emerald-400 mt-2 font-mono">● Verified via SQL Aggregates</p>
                   </div>
 
+                  {/* Card 2: Runway & Live Collapse Countdown */}
                   <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between">
                     <div className="flex justify-between items-start">
                       <p className="text-xs text-zinc-400">Estimated Runway</p>
@@ -455,12 +540,14 @@
                     </div>
                   </div>
 
+                  {/* Card 3: Inflow / Outflow */}
                   <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between">
                     <p className="text-xs text-zinc-400">30D Inflow / Outflow</p>
                     <p className="text-lg font-mono font-bold mt-2 text-zinc-200">₹{inflow.toLocaleString()} / ₹{burn.toLocaleString()}</p>
                     <p className="text-[11px] text-zinc-400 mt-2 font-mono">Net: ₹{(inflow - burn).toLocaleString()}</p>
                   </div>
 
+                  {/* Card 4: Recurring Commitments */}
                   <div className="bg-zinc-900/70 border border-zinc-800 p-4 rounded-xl flex flex-col justify-between">
                     <p className="text-xs text-zinc-400">Recurring Commitments</p>
                     <p className="text-2xl font-mono font-bold mt-2 text-zinc-100">₹{recurring.toLocaleString("en-IN")}</p>
